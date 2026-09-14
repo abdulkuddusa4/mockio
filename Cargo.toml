@@ -1,0 +1,12 @@
+[package]
+name = "mockio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mio = { version = "1.2.3", features = ["net", "os-poll"] }
+slab = "0.4.12"
+
+# [[bin]]
+# name = "a_bin"
+# path = "src/a_bin.rs"
