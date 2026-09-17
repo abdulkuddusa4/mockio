@@ -123,35 +123,38 @@
 //     // tokio::task::println!("result: {result}");
 // }
 
+use std::os::fd::IntoRawFd;
 use std::time::{Duration, Instant};
 
-use mockio::executor::{self, Timer};
+use io_uring::types::io_uring_region_desc;
+use mockio::executor::{self, timer};
 
 use mockio::{TcpListener, TcpStream};
 async fn main_task() {
-    let listener = TcpListener::bind("127.0.0.1:7788".parse().unwrap()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:7788".parse().unwrap());
     let mut id = 0;
     println!("listening on 127.0.0.1:7788");
     loop {
         let (stream, _) = listener.accept().await.unwrap();
         println!("accepted connection from user - {id}");
+
         mockio::spawn(handle_connection(stream, id));
+
         id += 1;
     }
 }
 
 async fn handle_connection(mut stream: TcpStream, id: usize) {
-    let mut buffer: [u8; 1024] = [0; 1024];
-    stream.read(&mut buffer).await.unwrap();
+    let mut buffer: Box<[u8]> = Box::new([0; 1024]);
+    let (ln, buffer) = stream.read(buffer).await.unwrap();
 
-    // println!("{:?}", String::from_utf8_lossy(&buffer));
     let get = b"GET / HTTP/1.1\r\n";
     let sleep = b"GET /sleep HTTP/1.1\r\n";
 
     let (status_line, filename) = if buffer.starts_with(get) {
         ("HTTP/1.1 200 OK", "index.html")
     } else if buffer.starts_with(sleep) {
-        Timer::new(Instant::now() + Duration::from_secs(7)).await;
+        timer(Duration::from_secs(7)).await;
         ("HTTP/1.1 200 OK", "index.html")
     } else {
         ("HTTP/1.1 404 OK", "404.html")
@@ -165,13 +168,16 @@ async fn handle_connection(mut stream: TcpStream, id: usize) {
         contents.len(),
         contents
     );
-    stream.write_all(response.as_bytes()).await.unwrap();
+    stream.write(response.as_bytes().into()).await.unwrap();
     // stream.flush().unwrap();
 }
+// use std::os::unix::io::{AsRawFd, RawFd};
 
 fn main() {
-    let executor = executor::Executor::current();
-    executor.spawn(main_task());
+    let executor = mockio::executor::Executor::current();
+    // println!("executor: {:p}", &executor);
 
+    executor.spawn(main_task());
+    // println!("START {}", executor.queue().borrow().len());
     executor.run();
 }

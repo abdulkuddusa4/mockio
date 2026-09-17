@@ -4,8 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+io-uring = "0.7.15"
+libc = "0.2.189"
 mio = { version = "1.2.3", features = ["net", "os-poll"] }
 slab = "0.4.12"
+
+# Only used by the benchmark programs in examples/, as a reference point.
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt", "net", "io-util", "time"] }
 
 # [[bin]]
 # name = "a_bin"

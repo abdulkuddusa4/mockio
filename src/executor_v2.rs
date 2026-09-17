@@ -24,7 +24,7 @@ macro_rules! print_task_ref {
 type SharedQueue<T> = Rc<RefCell<VecDeque<T>>>;
 use std::time::Instant;
 
-use crate::io_driver::{IO_DRIVER, IoDriver};
+use crate::io_uring_driver::{self, OpWaiter, U_DRIVER, UDriver};
 
 #[derive(Debug)]
 pub struct TimerEntry {
@@ -68,13 +68,6 @@ impl Task {
     pub fn schedule(self: &Rc<Self>) {
         self.queue.borrow_mut().push_back(self.clone());
     }
-}
-
-#[derive(Clone)]
-pub struct Executor {
-    queue: SharedQueue<Rc<Task>>,
-    timer_heap: Rc<RefCell<BinaryHeap<Reverse<TimerEntry>>>>,
-    io_driver: IoDriver,
 }
 
 static VT: RawWakerVTable = RawWakerVTable::new(clone_fn, wake_fn, wake_by_ref_fn, drop_fn);
@@ -137,6 +130,11 @@ impl<T> Future for JoinHandle<T> {
         }
     }
 }
+#[derive(Clone)]
+pub struct Executor {
+    queue: SharedQueue<Rc<Task>>,
+    udriver: UDriver,
+}
 
 thread_local! {
     static CURRENT_EXECUTOR: Rc<Executor> = Rc::new(Executor::new());
@@ -145,8 +143,7 @@ impl Executor {
     pub fn new() -> Self {
         Self {
             queue: Rc::new(RefCell::new(VecDeque::new())),
-            timer_heap: TIMER_HEAP.with(|heap| heap.clone()),
-            io_driver: IO_DRIVER.with(|driver| driver.clone()),
+            udriver: U_DRIVER.with(|driver| driver.clone()),
         }
     }
 
@@ -178,59 +175,23 @@ impl Executor {
             self.queue.borrow_mut().push_back(tsk);
         }
     }
+    pub fn queue(&self) -> &SharedQueue<Rc<Task>> {
+        &self.queue
+    }
 
     pub fn run(&self) {
         loop {
-            println!("tick");
-
-            // Collect first: polling a task can re-enter the executor (spawn, wake),
-            // and holding the queue's RefMut across `poll` would panic.
             let ready: Vec<Rc<Task>> = self.queue.borrow_mut().drain(..).collect();
             for task in ready {
                 let waker = make_waker(task.clone());
                 let mut cx = std::task::Context::from_waker(&waker);
                 let _ = task.future.borrow_mut().as_mut().poll(&mut cx);
             }
-
-            loop {
-                let expired = self
-                    .timer_heap
-                    .borrow()
-                    .peek()
-                    .is_some_and(|val| val.0.instant <= Instant::now());
-                if !expired {
-                    break;
-                }
-                let entry = self.timer_heap.borrow_mut().pop().unwrap();
-                entry.0.waker.wake();
-            }
-
-            if !self.queue.borrow().is_empty() {
+            if !self.queue().borrow().is_empty() {
                 continue;
             }
 
-            let next_deadline = self.timer_heap.borrow().peek().map(|val| val.0.instant);
-            if self
-                .io_driver
-                .pull_events(next_deadline.map(|val| val - Instant::now()))
-                .is_err()
-            {
-                println!(
-                    "file: {}:{} error while pulling. exiting.",
-                    file!(),
-                    line!()
-                );
-                break;
-            }
-            // match next_deadline {
-            //     Some(val) => {
-            //         // thread::park_timeout(val - Instant::now());
-
-            //         // let mut io_driver = self.io_driver.borrow();
-            //         // io_driver.pull_events();
-            //     }
-            //     None => break,
-            // }
+            self.udriver.pull_completions();
         }
     }
 }
@@ -238,40 +199,17 @@ impl Executor {
 thread_local! {
     pub static TASKS: RefCell<Vec<Rc<Task>>> = RefCell::new(Vec::new());
 }
-pub struct Timer {
-    pub instant: Instant, // when to timeout
-    pub registered: bool,
-}
 
-impl Timer {
-    pub fn new(instant: Instant) -> Self {
-        Self {
-            instant,
-            registered: false,
-        }
-    }
-}
-
-impl Future for Timer {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, ctx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        if self.instant < Instant::now() {
-            // println!("registering done.");
-            Poll::Ready(())
-        } else {
-            if !self.registered {
-                // cx.waker().wake();
-                // println!("registering");
-                self.registered = true;
-                TIMER_HEAP.with(|val| {
-                    val.borrow_mut().push(Reverse(TimerEntry {
-                        instant: self.instant.clone(),
-                        waker: ctx.waker().clone(),
-                    }));
-                })
-            }
-            Poll::Pending
-        }
-    }
+pub async fn timer(duration: std::time::Duration) {
+    let op = io_uring_driver::Op {
+        kind: io_uring_driver::OpKind::Timer {
+            timer_spec: Box::new(io_uring::types::Timespec::from(duration)),
+        },
+        waker: None,
+        result: None,
+    };
+    let result = OpWaiter::new(-1, op, U_DRIVER.with(Clone::clone))
+        .unwrap()
+        .await
+        .unwrap();
 }
