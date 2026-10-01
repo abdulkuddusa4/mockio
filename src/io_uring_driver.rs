@@ -101,10 +101,9 @@ impl OpResult {
     pub fn new(result: i32, kind: OpKind) -> Self {
         Self { result, kind }
     }
-    #[track_caller]
-    pub fn as_accept(&self) -> (i32, Box<libc::sockaddr_storage>, Box<libc::socklen_t>) {
-        match &self.kind {
-            OpKind::Accept { addr, addr_len } => (self.result, addr.clone(), addr_len.clone()),
+    pub fn into_accept(self) -> (i32, Box<libc::sockaddr_storage>, Box<libc::socklen_t>) {
+        match self.kind {
+            OpKind::Accept { addr, addr_len } => (self.result, addr, addr_len),
             _ => panic!(
                 "not an accept op. caller: {:?}",
                 std::panic::Location::caller()
@@ -112,10 +111,9 @@ impl OpResult {
         }
     }
 
-    #[track_caller]
-    pub fn as_read(&self) -> (i32, Box<[u8]>) {
-        match &self.kind {
-            OpKind::Read { buffer } => (self.result, buffer.clone()),
+    pub fn into_read(self) -> (i32, Box<[u8]>) {
+        match self.kind {
+            OpKind::Read { buffer } => (self.result, buffer),
             _ => panic!(
                 "not a read op. caller: {:?}",
                 std::panic::Location::caller()
@@ -123,10 +121,9 @@ impl OpResult {
         }
     }
 
-    #[track_caller]
-    pub fn as_write(&self) -> (i32, Box<[u8]>) {
-        match &self.kind {
-            OpKind::Write { buffer } => (self.result, buffer.clone()),
+    pub fn into_write(self) -> (i32, Box<[u8]>) {
+        match self.kind {
+            OpKind::Write { buffer } => (self.result, buffer),
             _ => panic!(
                 "not a write op. caller: {:?}",
                 std::panic::Location::caller()
@@ -382,7 +379,7 @@ impl TcpListener {
         };
         // let token = self.udriver.submit(self.inner.as_raw_fd(), op)?;
         let op_result = OpWaiter::new(self.inner.as_raw_fd(), op, self.udriver.clone())?.await?;
-        let (result, addr, addr_len) = op_result.as_accept();
+        let (result, addr, addr_len) = op_result.into_accept();
         if result < 0 {
             return Err(std::io::Error::from_raw_os_error(result));
         }
@@ -418,7 +415,7 @@ impl TcpStream {
         };
         // println!("read wait..");
         let result = OpWaiter::new(self.inner.as_raw_fd(), op, self.udriver.clone())?.await?;
-        let (result, buffer) = result.as_read();
+        let (result, buffer) = result.into_read();
         if result < 0 {
             return Err(std::io::Error::from_raw_os_error(result));
         }
@@ -437,7 +434,7 @@ impl TcpStream {
             self.udriver.clone(),
         )?
         .await?;
-        let (result, buffer) = result.as_write();
+        let (result, buffer) = result.into_write();
         if result < 0 {
             return Err(std::io::Error::from_raw_os_error(result));
         }
