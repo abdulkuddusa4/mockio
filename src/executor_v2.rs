@@ -207,6 +207,7 @@ pub async fn timer(duration: std::time::Duration) {
         },
         waker: None,
         result: None,
+        orphaned: false,
     };
     let result = OpWaiter::new(-1, op, U_DRIVER.with(Clone::clone))
         .unwrap()

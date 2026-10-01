@@ -47,6 +47,7 @@ pub(crate) struct Op {
     pub kind: OpKind,
     pub waker: Option<Waker>,
     pub result: Option<i32>,
+    pub orphaned: bool,
 }
 
 impl Debug for Op {
@@ -167,30 +168,32 @@ impl UDriver {
 impl UDriver {
     pub fn pull_completions(&self) {
         let mut inner_driver = &self.0;
-        // println!(
-        //     "Pulling completions... {} - op_map: {}",
-        //     { inner_driver.borrow_mut().uring.submission().len() },
-        //     { inner_driver.borrow_mut().op_map.len() }
-        // );
-        // inner_driver
-        //     .borrow()
-        //     .op_map
-        //     .iter()
-        //     .inspect(|val| {
-        //         println!("<{:?}>", val.1);
-        //     })
-        //     .count();
-        // println!("pulling completions ..");
-        inner_driver.borrow().uring.submit_and_wait(1);
-        let completions: Vec<_> = inner_driver.borrow_mut().uring.completion().collect();
 
-        let mut waker_list = Vec::with_capacity(completions.len());
-        for completion in completions {
-            let token = completion.user_data();
-            if let Some(op) = inner_driver.borrow_mut().op_map.get_mut(token as usize) {
-                op.result = Some(completion.result());
-                if let Some(waker) = op.waker.take() {
-                    waker_list.push(waker);
+        let mut waker_list;
+        inner_driver.borrow().uring.submit_and_wait(1);
+        {
+            let mut inner_driver = inner_driver.borrow_mut();
+            let completions: Vec<_> = inner_driver.uring.completion().collect();
+            waker_list = Vec::with_capacity(completions.len());
+
+            for completion in completions {
+                let token = completion.user_data();
+                let orphaned = match inner_driver.op_map.get_mut(token as usize) {
+                    Some(op) => {
+                        if op.orphaned {
+                            true
+                        } else {
+                            op.result = Some(completion.result());
+                            if let Some(waker) = op.waker.take() {
+                                waker_list.push(waker);
+                            }
+                            false
+                        }
+                    }
+                    None => continue,
+                };
+                if orphaned {
+                    inner_driver.op_map.try_remove(token as usize);
                 }
             }
         }
@@ -231,7 +234,19 @@ pub struct OpWaiter {
 impl Drop for OpWaiter {
     fn drop(&mut self) {
         let mut inner_driver = self.udriver.0.borrow_mut();
-        inner_driver.op_map.try_remove(self.token);
+        let slot = inner_driver.op_map.get_mut(self.token);
+        let is_result = match slot {
+            Some(slot) => {
+                slot.orphaned = true;
+                slot.result.is_some()
+            }
+            None => {
+                return ();
+            }
+        };
+        if is_result {
+            inner_driver.op_map.try_remove(self.token);
+        }
     }
 }
 
@@ -353,7 +368,8 @@ impl TcpListener {
 
     pub async fn accept(&self) -> std::io::Result<(TcpStream, std::net::SocketAddr)> {
         let mut addr_ptr: Box<libc::sockaddr_storage> = Box::new(unsafe { std::mem::zeroed() });
-        let mut addr_len = Box::new(std::mem::size_of::<libc::sockaddr>() as libc::socklen_t);
+        let mut addr_len =
+            Box::new(std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t);
 
         let op = Op {
             kind: OpKind::Accept {
@@ -362,10 +378,14 @@ impl TcpListener {
             },
             waker: None,
             result: None,
+            orphaned: false,
         };
         // let token = self.udriver.submit(self.inner.as_raw_fd(), op)?;
         let op_result = OpWaiter::new(self.inner.as_raw_fd(), op, self.udriver.clone())?.await?;
         let (result, addr, addr_len) = op_result.as_accept();
+        if result < 0 {
+            return Err(std::io::Error::from_raw_os_error(result));
+        }
         Ok(unsafe {
             (
                 TcpStream {
@@ -394,10 +414,14 @@ impl TcpStream {
             kind: OpKind::Read { buffer: buf },
             waker: None,
             result: None,
+            orphaned: false,
         };
         // println!("read wait..");
         let result = OpWaiter::new(self.inner.as_raw_fd(), op, self.udriver.clone())?.await?;
         let (result, buffer) = result.as_read();
+        if result < 0 {
+            return Err(std::io::Error::from_raw_os_error(result));
+        }
         Ok((result as usize, buffer))
     }
 
@@ -408,11 +432,15 @@ impl TcpStream {
                 kind: OpKind::Write { buffer: buf },
                 waker: None,
                 result: None,
+                orphaned: false,
             },
             self.udriver.clone(),
         )?
         .await?;
         let (result, buffer) = result.as_write();
+        if result < 0 {
+            return Err(std::io::Error::from_raw_os_error(result));
+        }
         Ok((result as usize, buffer))
     }
 }
